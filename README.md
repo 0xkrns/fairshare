@@ -40,8 +40,6 @@ FairShare lives. Drop a receipt photo into the group and five agents take over.
 | 4 | **Settler** | Minimum-transaction debt netting, then a verdict on whether it's even worth settling (`agents/settler.py`) | — |
 | 5 | **Nudge** | Wakes up on its own, writes the awkward reminder in the group's own tone (`agents/nudge.py`) | Delivers into the conversation, matched to how that group talks. |
 
-## Two deliberate design decisions
-
 **1. The LLM never touches money arithmetic.** Debt netting is a
 deterministic greedy match (`settler.simplify`), splits are forced to sum
 exactly (`negotiator._force_sum`), and the parser trusts its own sum over the
@@ -66,12 +64,6 @@ cp .env.example .env      # add TELEGRAM_BOT_TOKEN + OPENROUTER_API_KEY
 python bot.py
 ```
 
-**Telegram setup (2 minutes):**
-1. `/newbot` to [@BotFather](https://t.me/BotFather) → copy the token.
-2. **`/setprivacy` → your bot → `Disable`.** ⚠️ Without this the bot cannot see
-   group messages and agents 3 and 5 will silently do nothing.
-3. Add the bot to a group. Send `/help`.
-
 | Action | Agent triggered |
 |---|---|
 | send a receipt photo | Parser → Negotiator |
@@ -79,24 +71,3 @@ python bot.py
 | reply "I didn't order the wine" (or `/dispute ...`) | Mediator proposes; group applies or keeps the original |
 | `/settle` | Settler |
 | `/nudge` / `/nudge 20` | Nudge (the `20` version fires on its own while the bot stays online) |
-
-## Judging criteria → where to look
-
-- **Core requirements & functionality** — complete loop: photo → itemise →
-  clarify → ledger → dispute → settle → chase. Nothing is a stub.
-- **Innovation & theme alignment** — the chat isn't a UI skin. It supplies the
-  receipt, the social graph (who's in the group = who's splitting), the dispute
-  evidence, and the delivery channel. Agent 3 cannot exist elsewhere.
-- **Technical execution** — append-only event log, agents isolated behind one
-  LLM boundary (`llm.py`), JSON-schema-constrained calls, arithmetic kept out
-  of the model, `verify.py`, and a poll loop that survives any agent failure.
-- **Usefulness & agentic experience** — each person selects exactly what they
-  had; the group controls every ledger adjustment; Agent 5 acts with no human prompt.
-
-## Sponsor integrations
-
-- **OpenRouter** — every vision and reasoning call goes through OpenRouter's
-  OpenAI-compatible API. Configure the model slugs in `.env`.
-- **Nudge scheduling** — the current demo uses an in-memory timer. A restart
-  cancels scheduled nudges; durable scheduling is not implemented yet.
-- **ClickHouse** — the event log is already append-only; it's a drop-in sink.
