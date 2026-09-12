@@ -1,6 +1,4 @@
-# FairShare — a bill-splitting agent swarm that lives in the group chat
-
-> Built for **AI Tinkerers "Agents, Everywhere" — Singapore**, Sep 2026.
+# FairShare
 
 Expense apps are good at *recording* who owes what. They are bad at every
 human part around it: getting the receipt in, deciding what's **fair** rather
