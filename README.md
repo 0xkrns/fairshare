@@ -72,11 +72,31 @@ python bot.py
    group messages and agents 3 and 5 will silently do nothing.
 3. Add the bot to a group. Send `/help`.
 
+## Ask FairShare naturally
+
+`/fair <request>` is the universal chat command. It recognizes what a group
+member wants to do, then routes to the existing ledger-backed workflow. The
+intent is constrained to the actions below, and it falls back to local keyword
+matching if the model is unavailable.
+
+| Say this in the group | Recognized intent | Result |
+|---|---|---|
+| `/fair who owes what` | settle | Computes the minimum useful transfers. |
+| `/fair remind Sam in 20 seconds` | nudge | Drafts or schedules a payment reminder. |
+| `/fair wait 2h before finalizing` | finalize | Sets the selection window for future receipt splits. |
+| `/fair I didn't have the wine` | dispute | Starts the mediator's evidence-gathering flow. |
+| `/fair what is the logic for the split` | explain | Explains the latest split from the ledger: payer, shares, receipt items, assumptions, adjustments, and total check. |
+
+Direct commands such as `/settle`, `/nudge`, `/finalize`, `/dispute`, and
+`/explain` remain available as shortcuts.
+
 | Action | Agent triggered |
 |---|---|
 | send a receipt photo | Parser → Negotiator |
 | tap every item you had, then “I’m done selecting” | Negotiator (resolution after every member responds or the timeout) |
 | reply "I didn't order the wine" (or `/dispute ...`) | Mediator proposes; group applies or keeps the original |
+| `/fair <request>` | Intent recognition → settle, nudge, finalize, dispute, or explain |
+| `/explain` | Ledger-backed explanation of the latest split |
 | `/settle` | Settler |
 | `/nudge` / `/nudge 20` | Nudge (the `20` version fires on its own while the bot stays online) |
 
