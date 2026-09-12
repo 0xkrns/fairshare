@@ -10,7 +10,7 @@ import re
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from dotenv import load_dotenv
@@ -100,7 +100,7 @@ def selection_text(pend):
         selected = [pend["items"][index]["name"] for index, claimers in pend["claims"].items() if name in claimers]
         status = "✓ done" if user_id in pend["responded"] else "selecting"
         lines.append(f"• {name} ({status}): " + (", ".join(selected) if selected else "nothing selected"))
-    lines.append(f"Final split: {pend['finalize_note']}")
+    lines.append(pend["finalize_note"])
     return "\n".join(lines)
 
 
@@ -123,6 +123,75 @@ def parse_finalize_delay(value):
         return None
     amount, unit = int(match.group(1)), match.group(2)
     return amount * (60 if unit == "m" else 3600)
+
+
+def finalize_time_text(delay):
+    if not delay:
+        return "The final split will publish when everyone is done, or when the selection window closes."
+    when = datetime.now().astimezone() + timedelta(seconds=delay)
+    return "*Final split will be published at %s.*" % when.strftime("%I:%M %p").lstrip("0")
+
+
+def set_finalize_delay(chat_id, delay, label):
+    FINALIZE_DELAYS[chat_id] = delay
+    if delay:
+        return send(chat_id, f"Future receipt splits are scheduled for {label}. The bot will simply publish at that time.")
+    return send(chat_id, "Future receipt splits will publish after everyone finishes, or when the selection window closes.")
+
+
+def finalize_keyboard():
+    return [
+        [{"text": "Start now", "callback_data": "schedule:now"}],
+        [{"text": "In 30 minutes", "callback_data": "schedule:30m"},
+         {"text": "In 2 hours", "callback_data": "schedule:2h"}],
+        [{"text": "End of day", "callback_data": "schedule:eod"}],
+    ]
+
+
+def begin_participation(chat_id, pending_id):
+    pend = PENDING.get(chat_id)
+    if not pend or pend.get("id") != pending_id or pend.get("kind") != "waiting_to_select":
+        return
+    pend["kind"] = "participation"
+    pend["responses"] = {}
+    pend["timer"] = threading.Timer(SELECTION_TIMEOUT_SECONDS, expire_participation, args=(chat_id, pending_id))
+    pend["timer"].daemon = True
+    pend["timer"].start()
+    send(
+        chat_id,
+        "*Were you part of this receipt?*\nChoose first; only people who answer *I was part of it* will see the item checklist.",
+        keyboard=[[{"text": "I was part of it", "callback_data": "participation:yes"},
+                   {"text": "I wasn't part of it", "callback_data": "participation:no"}]],
+    )
+
+
+def begin_item_selection(chat_id, pend):
+    selected = {user_id: name for user_id, name in pend["all_participants"].items() if pend["responses"].get(user_id)}
+    if not selected:
+        del PENDING[chat_id]
+        return send(chat_id, "No one confirmed participation, so no split was recorded.")
+    pend["participants"] = selected
+    pend["kind"] = "items"
+    pend["claims"] = {}
+    pend["responded"] = set()
+    # Rebase the proposed total among confirmed participants before assigning
+    # their individual selections.
+    equal_share = pend["receipt"]["total_cents"] // len(selected)
+    pend["prop"]["split"] = negotiator._force_sum(
+        {name: equal_share for name in selected.values()}, pend["receipt"]["total_cents"], pend["payer"]
+    )
+    pend["timer"] = threading.Timer(SELECTION_TIMEOUT_SECONDS, expire_item_selection, args=(chat_id, pend["id"]))
+    pend["timer"].daemon = True
+    pend["timer"].start()
+    sent = send(chat_id, selection_text(pend), keyboard=selection_keyboard(pend))
+    pend["message_id"] = sent.get("result", {}).get("message_id")
+
+
+def expire_participation(chat_id, pending_id):
+    pend = PENDING.get(chat_id)
+    if not pend or pend.get("kind") != "participation" or pend.get("id") != pending_id:
+        return
+    begin_item_selection(chat_id, pend)
 
 
 # ---------------------------------------------------------------- handlers
@@ -155,30 +224,23 @@ def handle_photo(chat_id, msg):
     if len(names) > 1 and selectable:
         participant_names = {member["user_id"]: member["name"] for member in ledger.members(chat_id)}
         delay = FINALIZE_DELAYS.get(chat_id, 0)
-        selection_timeout = max(SELECTION_TIMEOUT_SECONDS, delay)
-        finalize_note = "when everyone is done or in %ss" % selection_timeout
         PENDING[chat_id] = {
-            "kind": "items",
+            "kind": "waiting_to_select",
             "receipt": receipt,
             "prop": prop,
             "payer": payer,
             "items": [{"name": name, "cents": cents} for _, cents, name in selectable],
-            "participants": participant_names,
-            "claims": {},
-            "responded": set(),
-            "finalize_delay": delay,
-            "finalize_note": finalize_note,
+            "all_participants": participant_names,
+            "finalize_note": finalize_time_text(delay),
         }
         pend = PENDING[chat_id]
         pend["id"] = time.monotonic_ns()
-        pend["timer"] = threading.Timer(
-            selection_timeout, expire_item_selection, args=(chat_id, pend["id"])
-        )
+        pend["timer"] = threading.Timer(delay, begin_participation, args=(chat_id, pend["id"]))
         pend["timer"].daemon = True
         pend["timer"].start()
-        sent = send(chat_id, selection_text(pend), keyboard=selection_keyboard(pend))
-        pend["message_id"] = sent.get("result", {}).get("message_id")
-        return
+        if delay:
+            return send(chat_id, f"Receipt saved. {finalize_time_text(delay)} I will open the group check-in then.")
+        return begin_participation(chat_id, pend["id"])
 
     commit_split(chat_id, receipt, prop["split"], payer, prop.get("assumptions", []))
 
@@ -295,8 +357,27 @@ def apply_mediation(chat_id, pend):
 def handle_callback(cb):
     chat_id = cb["message"]["chat"]["id"]
     who = name_of(cb["from"])
-    pend = PENDING.get(chat_id)
     data = cb.get("data", "")
+    if data.startswith("schedule:"):
+        choices = {"now": (0, "immediately after responses"), "30m": (1800, "30 minutes after the receipt"),
+                   "2h": (7200, "2 hours after the receipt"), "eod": (parse_finalize_delay("eod"), "end of day")}
+        choice = data.split(":", 1)[1]
+        if choice not in choices:
+            return answer_callback(cb["id"], "Unknown schedule.")
+        delay, label = choices[choice]
+        answer_callback(cb["id"], "Finalization time saved.")
+        pend = PENDING.get(chat_id)
+        if pend and pend.get("kind") == "schedule_receipt":
+            pend["kind"] = "waiting_to_select"
+            pend["finalize_note"] = finalize_time_text(delay)
+            pend["timer"] = threading.Timer(delay, begin_participation, args=(chat_id, pend["id"]))
+            pend["timer"].daemon = True
+            pend["timer"].start()
+            if delay:
+                return send(chat_id, f"{finalize_time_text(delay)} I will ask who was part of the receipt at that time.")
+            return begin_participation(chat_id, pend["id"])
+        return set_finalize_delay(chat_id, delay, label)
+    pend = PENDING.get(chat_id)
     if not pend or ":" not in data:
         return answer_callback(cb["id"], "This action has expired.")
 
@@ -309,6 +390,18 @@ def handle_callback(cb):
         del PENDING[chat_id]
         answer_callback(cb["id"], "Kept the original split.")
         return send(chat_id, "*No changes made.* The original split remains in the ledger.")
+
+    if scope == "participation":
+        user_id = cb["from"]["id"]
+        if user_id not in pend["all_participants"]:
+            return answer_callback(cb["id"], "Only group members in this receipt can respond.")
+        pend["responses"][user_id] = action == "yes"
+        answer_callback(cb["id"], "Participation saved.")
+        expected = set(pend["all_participants"])
+        if set(pend["responses"]) == expected:
+            pend["timer"].cancel()
+            return begin_item_selection(chat_id, pend)
+        return
 
     if scope == "items":
         user_id = cb["from"]["id"]
@@ -570,7 +663,8 @@ def handle_message(msg):
     if "photo" in msg:
         return handle_photo(chat_id, msg)
     if cmd in ("/start", "/help"):
-        return send(chat_id, HELP)
+        send(chat_id, HELP)
+        return send(chat_id, "*When should I publish future receipt splits?*", keyboard=finalize_keyboard())
     if cmd == "/fair":
         return handle_fair(chat_id, msg, text[len("/fair"):].strip())
     if cmd == "/settle":
@@ -580,13 +674,21 @@ def handle_message(msg):
         return handle_nudge(chat_id, int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0)
     if cmd == "/finalize":
         value = text[len("/finalize"):].strip()
+        if not value:
+            return send(
+                chat_id,
+                "*When should I publish the final split for future receipts?*",
+                keyboard=[
+                    [{"text": "When everyone is done", "callback_data": "schedule:now"}],
+                    [{"text": "In 30 minutes", "callback_data": "schedule:30m"},
+                     {"text": "In 2 hours", "callback_data": "schedule:2h"}],
+                    [{"text": "End of day", "callback_data": "schedule:eod"}],
+                ],
+            )
         delay = parse_finalize_delay(value)
         if delay is None:
             return send(chat_id, "Use `/finalize now`, `/finalize 30m`, `/finalize 2h`, or `/finalize eod`.")
-        FINALIZE_DELAYS[chat_id] = delay
-        if delay:
-            return send(chat_id, f"Future receipt splits will post after the selected {value} wait period, even if everyone finishes early.")
-        return send(chat_id, "Future receipt splits will post as soon as everyone finishes, or when the selection window expires.")
+        return set_finalize_delay(chat_id, delay, value)
     if cmd == "/dispute":
         return handle_dispute(chat_id, msg, text[len("/dispute"):].strip() or "unspecified")
     if DISPUTE_RE.search(text) and ledger.events(chat_id, "expense"):
