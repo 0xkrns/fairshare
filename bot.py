@@ -255,7 +255,6 @@ def commit_split(chat_id, receipt, split, payer, assumptions):
             "payer": payer,
             "shares": split,
             "items": receipt.get("items", []),
-            "assumptions": assumptions,
         },
     )
     body = "\n".join(f"  {n} — {ledger.money(c)}" for n, c in sorted(split.items()))
@@ -470,58 +469,6 @@ def handle_settle(chat_id):
     send(chat_id, f"*Settle up* ({len(transfers)} transfer(s) → {len(keep)})\n{body}{extra}\n\n{verdict}")
 
 
-def handle_explain(chat_id):
-    """Explain the latest bill using recorded facts, never reconstructed LLM math."""
-    expenses = ledger.events(chat_id, "expense")
-    if not expenses:
-        return send(chat_id, "There isn't a recorded split to explain yet. Send a receipt first.")
-
-    expense = expenses[-1]
-    shares = expense.get("shares", {})
-    total = int(expense.get("total_cents", sum(shares.values())))
-    lines = [
-        f"*How the {expense.get('merchant', 'latest')} split works*",
-        f"{expense.get('payer', 'Someone')} paid {ledger.money(total)}.",
-        "That receipt was allocated as:",
-    ]
-    lines.extend(f"  • {name}: {ledger.money(cents)}" for name, cents in sorted(shares.items()))
-
-    assumptions = expense.get("assumptions") or []
-    if assumptions:
-        lines.append("\n*Why:* " + "; ".join(assumptions))
-
-    items = expense.get("items") or []
-    if items:
-        listed = ", ".join(
-            f"{item.get('name', 'item')} ({ledger.money(int(item.get('cents', 0)))})"
-            for item in items[:8]
-        )
-        if len(items) > 8:
-            listed += ", …"
-        lines.append("\n*Receipt items:* " + listed)
-
-    adjustments = [
-        event for event in ledger.events(chat_id, "adjustment")
-        if event.get("merchant") == expense.get("merchant", "expense") + " (mediated)"
-    ]
-    if adjustments:
-        adjustment = adjustments[-1]
-        changes = [
-            f"{name} {'+' if int(delta) > 0 else ''}{ledger.money(int(delta))}"
-            for name, delta in sorted(adjustment.get("shares", {}).items()) if int(delta)
-        ]
-        lines.append("\n*A mediator later adjusted it:* " + ", ".join(changes) + ".")
-        if adjustment.get("reason"):
-            lines.append(adjustment["reason"])
-
-    allocated = sum(int(cents) for cents in shares.values())
-    lines.append(
-        f"\nCheck: the recorded shares total {ledger.money(allocated)}"
-        + (", matching the receipt." if allocated == total else f", while the receipt total is {ledger.money(total)}.")
-    )
-    return send(chat_id, "\n".join(lines))
-
-
 def handle_dispute(chat_id, msg, complaint):
     if PENDING.get(chat_id, {}).get("kind") == "items":
         return send(chat_id, "Finish or cancel the current item selection before starting a dispute.")
@@ -601,7 +548,6 @@ HELP = (
     "📸 *Send a receipt photo* — I itemise it and propose a _fair_ split, not an equal one.\n"
     "↩️ *Reply to a split* with what's wrong — a mediator proposes a change for the group to approve.\n"
     "`/settle` — minimum transfers, plus whether it's even worth it.\n"
-    "`/explain` — show the ledger-backed reasoning for the latest split.\n"
     "`/nudge` — I write the awkward reminder for you.\n"
     "`/nudge 20` — and I'll send it on my own in 20s.\n"
     "`/finalize 2h` — wait two hours before finalizing future receipt splits (`30m`, `eod`, or `now` also work).\n"
@@ -619,7 +565,6 @@ Choose exactly one intent:
 - nudge: write or schedule a payment reminder
 - finalize: set how long future receipt item-selection windows should wait
 - dispute: challenge a receipt split or say an item was not theirs
-- explain: explain how the latest receipt split or current balances were calculated
 - help: ask what FairShare can do, or anything unrelated/unclear
 
 Extract `delay` only for nudge as a non-negative integer number of seconds.
@@ -628,15 +573,13 @@ For a dispute, put the user's original complaint in `detail`.
 Never invent payment amounts, names, receipt items, or delays. Return only JSON."""
 
 FAIR_INTENT_HINT = """Schema:
-{"intent":"settle"|"nudge"|"finalize"|"dispute"|"explain"|"help",
+{"intent":"settle"|"nudge"|"finalize"|"dispute"|"help",
  "delay":null|int, "finalize":null|str, "detail":null|str}"""
 
 
 def fallback_fair_intent(request):
     """Useful offline fallback when the intent model is unavailable."""
     text = request.lower().strip()
-    if any(word in text for word in ("explain", "logic", "breakdown", "how was", "how did", "why am i", "why do i")):
-        return {"intent": "explain"}
     if DISPUTE_RE.search(text):
         return {"intent": "dispute", "detail": request}
     if any(word in text for word in ("settle", "owe", "owed", "who pays", "who should pay")):
@@ -662,7 +605,7 @@ def fair_intent(request):
     """Return a validated intent; model failure must not break the chat command."""
     fallback = fallback_fair_intent(request)
     out = json_call(FAIR_INTENT_SYSTEM, request, schema_hint=FAIR_INTENT_HINT)
-    if "_error" in out or out.get("intent") not in {"settle", "nudge", "finalize", "dispute", "explain", "help"}:
+    if "_error" in out or out.get("intent") not in {"settle", "nudge", "finalize", "dispute", "help"}:
         return fallback
     intent = out["intent"]
     result = {"intent": intent}
@@ -688,8 +631,6 @@ def handle_fair(chat_id, msg, request):
     intent = fair_intent(request)
     if intent["intent"] == "settle":
         return handle_settle(chat_id)
-    if intent["intent"] == "explain":
-        return handle_explain(chat_id)
     if intent["intent"] == "nudge":
         return handle_nudge(chat_id, intent.get("delay", 0))
     if intent["intent"] == "finalize":
@@ -703,7 +644,7 @@ def handle_fair(chat_id, msg, request):
         return send(chat_id, "Future receipt splits will post as soon as everyone finishes, or when the selection window expires.")
     if intent["intent"] == "dispute":
         return handle_dispute(chat_id, msg, intent.get("detail", request))
-    return send(chat_id, "I can explain a split, settle up, nudge someone, set a receipt deadline, or mediate a disputed item. "
+    return send(chat_id, "I can settle up, nudge someone, set a receipt deadline, or mediate a disputed item. "
                 "For example: `/fair who owes what`.")
 
 
@@ -728,8 +669,6 @@ def handle_message(msg):
         return handle_fair(chat_id, msg, text[len("/fair"):].strip())
     if cmd == "/settle":
         return handle_settle(chat_id)
-    if cmd == "/explain":
-        return handle_explain(chat_id)
     if cmd == "/nudge":
         parts = text.split()
         return handle_nudge(chat_id, int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0)
