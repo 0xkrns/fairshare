@@ -19,6 +19,7 @@ load_dotenv()  # must run before agent imports read model names from env
 
 import ledger
 from agents import mediator, negotiator, nudge, parser, settler
+from llm import json_call
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
@@ -450,6 +451,7 @@ def handle_nudge(chat_id, delay=0):
 
 HELP = (
     "*FairShare* — I split bills where you actually argue about them.\n\n"
+    "`/fair <what you need>` — ask naturally: settle up, remind someone, set a deadline, or dispute an item.\n"
     "📸 *Send a receipt photo* — I itemise it and propose a _fair_ split, not an equal one.\n"
     "↩️ *Reply to a split* with what's wrong — a mediator proposes a change for the group to approve.\n"
     "`/settle` — minimum transfers, plus whether it's even worth it.\n"
@@ -462,6 +464,95 @@ DISPUTE_RE = re.compile(
     r"didn'?t (order|have|eat|drink)|not mine|wasn'?t me|i don'?t drink|that'?s wrong|unfair",
     re.I,
 )
+
+FAIR_INTENT_SYSTEM = """Classify a FairShare group-expense request.
+
+Choose exactly one intent:
+- settle: show who should pay whom or settle up
+- nudge: write or schedule a payment reminder
+- finalize: set how long future receipt item-selection windows should wait
+- dispute: challenge a receipt split or say an item was not theirs
+- help: ask what FairShare can do, or anything unrelated/unclear
+
+Extract `delay` only for nudge as a non-negative integer number of seconds.
+Extract `finalize` only as one of: now, <positive integer>m, <positive integer>h, eod.
+For a dispute, put the user's original complaint in `detail`.
+Never invent payment amounts, names, receipt items, or delays. Return only JSON."""
+
+FAIR_INTENT_HINT = """Schema:
+{"intent":"settle"|"nudge"|"finalize"|"dispute"|"help",
+ "delay":null|int, "finalize":null|str, "detail":null|str}"""
+
+
+def fallback_fair_intent(request):
+    """Useful offline fallback when the intent model is unavailable."""
+    text = request.lower().strip()
+    if DISPUTE_RE.search(text):
+        return {"intent": "dispute", "detail": request}
+    if any(word in text for word in ("settle", "owe", "owed", "who pays", "who should pay")):
+        return {"intent": "settle"}
+    if any(word in text for word in ("remind", "nudge", "chase", "follow up")):
+        seconds = re.search(r"\b(\d+)\s*(?:seconds?|secs?|s)\b", text)
+        return {"intent": "nudge", "delay": int(seconds.group(1)) if seconds else 0}
+    if any(word in text for word in ("finalize", "wait", "deadline", "end of day", "eod")):
+        value = re.search(r"\b(\d+\s*[mh])\b", text)
+        if "eod" in text or "end of day" in text:
+            choice = "eod"
+        elif value:
+            choice = value.group(1).replace(" ", "")
+        elif "now" in text:
+            choice = "now"
+        else:
+            choice = None
+        return {"intent": "finalize", "finalize": choice}
+    return {"intent": "help"}
+
+
+def fair_intent(request):
+    """Return a validated intent; model failure must not break the chat command."""
+    fallback = fallback_fair_intent(request)
+    out = json_call(FAIR_INTENT_SYSTEM, request, schema_hint=FAIR_INTENT_HINT)
+    if "_error" in out or out.get("intent") not in {"settle", "nudge", "finalize", "dispute", "help"}:
+        return fallback
+    intent = out["intent"]
+    result = {"intent": intent}
+    if intent == "nudge":
+        try:
+            result["delay"] = max(0, int(out.get("delay") or 0))
+        except (TypeError, ValueError):
+            result["delay"] = fallback.get("delay", 0)
+    elif intent == "finalize":
+        value = str(out.get("finalize") or "").strip().lower()
+        result["finalize"] = value if parse_finalize_delay(value) is not None else fallback.get("finalize")
+    elif intent == "dispute":
+        result["detail"] = str(out.get("detail") or request).strip()
+    return result
+
+
+def handle_fair(chat_id, msg, request):
+    """Natural-language command gateway for the existing, deterministic handlers."""
+    if not request.strip():
+        return send(chat_id, "Try `/fair who owes what`, `/fair remind Sam in 20 seconds`, "
+                    "`/fair wait 2h`, or `/fair I didn't have the wine`.")
+
+    intent = fair_intent(request)
+    if intent["intent"] == "settle":
+        return handle_settle(chat_id)
+    if intent["intent"] == "nudge":
+        return handle_nudge(chat_id, intent.get("delay", 0))
+    if intent["intent"] == "finalize":
+        value = intent.get("finalize")
+        delay = parse_finalize_delay(value or "")
+        if delay is None:
+            return send(chat_id, "Tell me a wait time, such as `/fair wait 30m`, `/fair wait 2h`, or `/fair finalize eod`.")
+        FINALIZE_DELAYS[chat_id] = delay
+        if delay:
+            return send(chat_id, f"Future receipt splits will post after the selected {value} wait period, even if everyone finishes early.")
+        return send(chat_id, "Future receipt splits will post as soon as everyone finishes, or when the selection window expires.")
+    if intent["intent"] == "dispute":
+        return handle_dispute(chat_id, msg, intent.get("detail", request))
+    return send(chat_id, "I can settle up, nudge someone, set a receipt deadline, or mediate a disputed item. "
+                "For example: `/fair who owes what`.")
 
 
 def handle_message(msg):
@@ -480,6 +571,8 @@ def handle_message(msg):
         return handle_photo(chat_id, msg)
     if cmd in ("/start", "/help"):
         return send(chat_id, HELP)
+    if cmd == "/fair":
+        return handle_fair(chat_id, msg, text[len("/fair"):].strip())
     if cmd == "/settle":
         return handle_settle(chat_id)
     if cmd == "/nudge":
