@@ -13,10 +13,10 @@ from collections import defaultdict, deque
 import requests
 from dotenv import load_dotenv
 
+load_dotenv()  # must run before agent imports read model names from env
+
 import ledger
 from agents import mediator, negotiator, nudge, parser, settler
-
-load_dotenv()
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
