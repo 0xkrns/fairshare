@@ -1,11 +1,11 @@
 # FairShare
 
-Expense apps are good at *recording* who owes what. They are bad at every
+Expense apps are good at recording who owes what. They are bad at every
 human part around it: getting the receipt in, deciding what's **fair** rather
 than equal, arguing about it, and chasing people without being awkward.
 
-Those parts all happen in one place — **the group chat** — so that is where
-FairShare lives. Drop a receipt photo into the group and five agents take over.
+Those parts all happen in one place, the group chat, so that is where
+FairShare lives. Drop a receipt photo into the group and the agents take over.
 
 ```
         📸 receipt photo dropped in the group
