@@ -6,6 +6,9 @@ instead of guessing. A web form cannot ask a follow-up.
 """
 from llm import json_call
 
+DRINK_WORDS = ("wine", "beer", "cocktail", "drink", "whisky", "whiskey", "vodka", "gin", "rum")
+SHARED_CHARGE_WORDS = ("tax", "tip", "service", "gst", "vat", "delivery", "discount")
+
 SYSTEM = """You are a fair-split agent for a group of friends.
 Given receipt line items and the group's members, decide how to split.
 
@@ -14,8 +17,9 @@ Rules:
 - Individually-consumed things (a bottle of wine, one dessert, alcohol, a
   specific main) should NOT be split evenly if it is plausible only some
   people had them.
-- You may ask AT MOST ONE clarifying question, and only about the single
-  highest-value ambiguous item. Prefer assuming even split over interrogating.
+- Ask EXACTLY ONE clarifying question whenever a receipt has an item that may
+  not have been shared. Ask about the single highest-value ambiguous item.
+  Prefer drinks and alcohol, because friends often do not share those equally.
 - Fairness beats precision. Do not ask about a $3 coffee."""
 
 HINT = """Schema:
@@ -35,8 +39,48 @@ def propose(receipt, member_names, payer):
     out = json_call(SYSTEM, user, schema_hint=HINT)
     if "_error" in out:
         return out
+    # Asking the group is a core product interaction, not an optional model
+    # flourish. If the model skips it, make the highest-value plausible item
+    # explicit so friends can tell us who consumed it.
+    if len(member_names) > 1 and not out.get("question"):
+        candidate = clarification_candidate(receipt)
+        if candidate:
+            out["question"] = {
+                "item": candidate["name"],
+                "cents": candidate["cents"],
+                "text": f"Who had {candidate['name']} (${candidate['cents'] / 100:.2f})?",
+            }
     out["split"] = _force_sum(out.get("split", {}), int(receipt.get("total_cents", 0)), payer)
     return out
+
+
+def clarification_candidate(receipt):
+    """Choose one consumable that merits a group answer, deterministically."""
+    candidates = selectable_items(receipt)
+    if not candidates:
+        return None
+    is_drink, cents, name = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+    return {"name": name, "cents": cents}
+
+
+def selectable_items(receipt):
+    """Return items people may need to claim individually.
+
+    Tax, tips, and other group charges are deliberately excluded from the
+    Telegram checklist: they are apportioned across the group automatically.
+    """
+    candidates = []
+    for item in receipt.get("items", []):
+        name = str(item.get("name", "")).strip()
+        cents = int(item.get("cents", 0) or 0)
+        lower_name = name.lower()
+        if not name or cents <= 0 or any(word in lower_name for word in SHARED_CHARGE_WORDS):
+            continue
+        # Explicitly shared items should not trigger an unnecessary question.
+        if item.get("shared") is True:
+            continue
+        candidates.append((any(word in lower_name for word in DRINK_WORDS), cents, name))
+    return candidates
 
 
 def _force_sum(split, total, payer):

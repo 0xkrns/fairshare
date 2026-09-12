@@ -15,7 +15,7 @@ FairShare lives. Drop a receipt photo into the group and five agents take over.
          └───────────┬────────────┘
          ┌───────────▼────────────┐
          │  2. NEGOTIATOR         │  fair ≠ equal. Asks the group ONE
-         │     (fair split)       │  question with tappable buttons
+         │     (fair split)       │  item checklist in the group chat
          └───────────┬────────────┘
                      │            ◄── group taps "that was me"
          ┏━━━━━━━━━━━▼━━━━━━━━━━━━┓
@@ -35,8 +35,8 @@ FairShare lives. Drop a receipt photo into the group and five agents take over.
 | # | Agent | What it does | Why it needs the chat |
 |---|-------|--------------|----------------------|
 | 1 | **Parser** | Receipt photo → itemised JSON (`agents/parser.py`) | The photo is *already* being dropped in the group. No upload, no form. |
-| 2 | **Negotiator** | Decides a **fair** split — someone who didn't drink doesn't pay for the wine (`agents/negotiator.py`) | It knows the group's members, can collect multiple tap-to-answer claims, and waits for the group to finalize. |
-| 3 | **Mediator** | "I didn't order that" → reads the receipt **and the conversation**, proposes a compromise, explains itself (`agents/mediator.py`) | The evidence for a dispute *is* the chat history; the group must approve the proposal before it changes the ledger. |
+| 2 | **Negotiator** | Decides a **fair** split — someone who didn't drink doesn't pay for the wine (`agents/negotiator.py`) | It shows only individually claimable items. Selections toggle visibly, and people can revise them before the final split posts. Use `/finalize 30m`, `/finalize 2h`, or `/finalize eod` to choose the wait period. |
+| 3 | **Mediator** | "I didn't order that" → reads the receipt **and the conversation**, asks one follow-up about the disputed item, then proposes a compromise with reasoning (`agents/mediator.py`) | The evidence for a dispute *is* the chat history; the group must approve the proposal before it changes the ledger. |
 | 4 | **Settler** | Minimum-transaction debt netting, then a verdict on whether it's even worth settling (`agents/settler.py`) | — |
 | 5 | **Nudge** | Wakes up on its own, writes the awkward reminder in the group's own tone (`agents/nudge.py`) | Delivers into the conversation, matched to how that group talks. |
 
@@ -75,7 +75,7 @@ python bot.py
 | Action | Agent triggered |
 |---|---|
 | send a receipt photo | Parser → Negotiator |
-| tap “I had it,” then “Finalize split” | Negotiator (resolution) |
+| tap every item you had, then “I’m done selecting” | Negotiator (resolution after every member responds or the timeout) |
 | reply "I didn't order the wine" (or `/dispute ...`) | Mediator proposes; group applies or keeps the original |
 | `/settle` | Settler |
 | `/nudge` / `/nudge 20` | Nudge (the `20` version fires on its own while the bot stays online) |
@@ -90,8 +90,8 @@ python bot.py
 - **Technical execution** — append-only event log, agents isolated behind one
   LLM boundary (`llm.py`), JSON-schema-constrained calls, arithmetic kept out
   of the model, `verify.py`, and a poll loop that survives any agent failure.
-- **Usefulness & agentic experience** — one tap resolves an ambiguous split;
-  group approval protects every ledger adjustment; Agent 5 acts with no human prompt.
+- **Usefulness & agentic experience** — each person selects exactly what they
+  had; the group controls every ledger adjustment; Agent 5 acts with no human prompt.
 
 ## Sponsor integrations
 

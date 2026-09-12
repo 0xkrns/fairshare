@@ -7,8 +7,10 @@ Run:  python bot.py
 """
 import os
 import re
+import threading
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
@@ -26,6 +28,9 @@ FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 TRANSCRIPT = defaultdict(lambda: deque(maxlen=40))
 # chat_id -> a pending split clarification or mediation awaiting group approval
 PENDING = {}
+SELECTION_TIMEOUT_SECONDS = int(os.getenv("SELECTION_TIMEOUT_SECONDS", "90"))
+# Per-chat delay for new receipts; set with /finalize <minutes|hours|eod>.
+FINALIZE_DELAYS = {}
 
 
 # ------------------------------------------------------------- telegram io
@@ -59,12 +64,64 @@ def answer_callback(cb_id, text=""):
     )
 
 
+def edit_message(chat_id, message_id, text, keyboard=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    requests.post(f"{API}/editMessageText", json=payload, timeout=20)
+
+
 def name_of(user):
     return user.get("first_name") or user.get("username") or str(user["id"])
 
 
 def transcript_text(chat_id):
     return "\n".join(TRANSCRIPT[chat_id]) or "(no conversation yet)"
+
+
+def selection_keyboard(pend):
+    rows = [
+        [{"text": f"{item['name']} — {ledger.money(item['cents'])}",
+          "callback_data": f"items:select:{index}"}]
+        for index, item in enumerate(pend["items"])
+    ]
+    rows.append([
+        {"text": "I'm done selecting", "callback_data": "items:done"},
+        {"text": "Change my selection", "callback_data": "items:change"},
+    ])
+    rows.append([{"text": "Cancel", "callback_data": "items:cancel"}])
+    return rows
+
+
+def selection_text(pend):
+    lines = ["*Which items did you have?*", "Tap every item you consumed; tap it again to remove it."]
+    for user_id, name in pend["participants"].items():
+        selected = [pend["items"][index]["name"] for index, claimers in pend["claims"].items() if name in claimers]
+        status = "✓ done" if user_id in pend["responded"] else "selecting"
+        lines.append(f"• {name} ({status}): " + (", ".join(selected) if selected else "nothing selected"))
+    lines.append(f"Final split: {pend['finalize_note']}")
+    return "\n".join(lines)
+
+
+def refresh_selection_message(chat_id, pend):
+    if pend.get("message_id"):
+        edit_message(chat_id, pend["message_id"], selection_text(pend), selection_keyboard(pend))
+
+
+def parse_finalize_delay(value):
+    """Return a delay in seconds for /finalize now, 30m, 2h, or eod."""
+    value = value.strip().lower()
+    if value in ("now", "instant"):
+        return 0
+    if value in ("eod", "end-of-day", "end of day"):
+        now = datetime.now().astimezone()
+        end = now.replace(hour=23, minute=59, second=0, microsecond=0)
+        return max(60, int((end - now).total_seconds()))
+    match = re.fullmatch(r"(\d+)(m|h)", value)
+    if not match:
+        return None
+    amount, unit = int(match.group(1)), match.group(2)
+    return amount * (60 if unit == "m" else 3600)
 
 
 # ---------------------------------------------------------------- handlers
@@ -93,27 +150,34 @@ def handle_photo(chat_id, msg):
     if "_error" in prop:
         return send(chat_id, f"Split agent failed: {prop['_error']}")
 
-    q = prop.get("question")
-    if q:
+    selectable = negotiator.selectable_items(receipt)
+    if len(names) > 1 and selectable:
+        participant_names = {member["user_id"]: member["name"] for member in ledger.members(chat_id)}
+        delay = FINALIZE_DELAYS.get(chat_id, 0)
+        selection_timeout = max(SELECTION_TIMEOUT_SECONDS, delay)
+        finalize_note = "when everyone is done or in %ss" % selection_timeout
         PENDING[chat_id] = {
-            "kind": "split",
+            "kind": "items",
             "receipt": receipt,
             "prop": prop,
             "payer": payer,
-            "claims": [],
-            "everyone": False,
+            "items": [{"name": name, "cents": cents} for _, cents, name in selectable],
+            "participants": participant_names,
+            "claims": {},
+            "responded": set(),
+            "finalize_delay": delay,
+            "finalize_note": finalize_note,
         }
-        kb = [
-            [{"text": "🙋 I had it", "callback_data": "split:claim"},
-             {"text": "Everyone shared it", "callback_data": "split:everyone"}],
-            [{"text": "Finalize split", "callback_data": "split:finalize"},
-             {"text": "Cancel", "callback_data": "split:cancel"}],
-        ]
-        return send(
-            chat_id,
-            f"❓ {q['text']}\n_Tap your answer, let others answer too, then finalize._",
-            keyboard=kb,
+        pend = PENDING[chat_id]
+        pend["id"] = time.monotonic_ns()
+        pend["timer"] = threading.Timer(
+            selection_timeout, expire_item_selection, args=(chat_id, pend["id"])
         )
+        pend["timer"].daemon = True
+        pend["timer"].start()
+        sent = send(chat_id, selection_text(pend), keyboard=selection_keyboard(pend))
+        pend["message_id"] = sent.get("result", {}).get("message_id")
+        return
 
     commit_split(chat_id, receipt, prop["split"], payer, prop.get("assumptions", []))
 
@@ -139,27 +203,71 @@ def commit_split(chat_id, receipt, split, payer, assumptions):
     )
 
 
-def finalize_split(chat_id, pend):
-    q = pend["prop"]["question"]
-    claimers = pend["claims"]
-    if not claimers and not pend["everyone"]:
-        return send(chat_id, "No one has answered yet. Choose an answer or cancel this split.")
-
+def item_split(pend):
+    """Start with the model proposal, then charge claimed items to claimers."""
     split = dict(pend["prop"]["split"])
-    if not pend["everyone"]:
-        # Reassign the contested item to everyone who opted in, evenly.
-        cents = int(q["cents"])
-        per = cents // len(claimers)
-        rem = cents - per * len(claimers)
-        for n in split:
-            split[n] = max(0, split[n] - cents // max(1, len(split)))
-        for idx, n in enumerate(claimers):
-            split[n] = split.get(n, 0) + per + (rem if idx == 0 else 0)
-        split = negotiator._force_sum(split, pend["receipt"]["total_cents"], pend["payer"])
+    members = list(pend["participants"].values())
+    for name in members:
+        split.setdefault(name, 0)
+    for index, claimers in pend["claims"].items():
+        if not claimers:
+            continue
+        cents = pend["items"][index]["cents"]
+        # Remove an equal allocation from everyone, then assign this item only
+        # to the people who explicitly selected it. Rounding stays deterministic.
+        per_member, member_remainder = divmod(cents, len(members))
+        for position, name in enumerate(members):
+            split[name] -= per_member + (1 if position < member_remainder else 0)
+        claimers = sorted(claimers)
+        per_claimer, claimer_remainder = divmod(cents, len(claimers))
+        for position, name in enumerate(claimers):
+            split[name] = split.get(name, 0) + per_claimer + (1 if position < claimer_remainder else 0)
+    return negotiator._force_sum(split, pend["receipt"]["total_cents"], pend["payer"])
 
+
+def finalize_item_selection(chat_id, pending_id, expired=False):
+    pend = PENDING.get(chat_id)
+    if not pend or pend.get("kind") != "items" or pend.get("id") != pending_id:
+        return
+    expected = set(pend["participants"])
+    if not expired and pend["responded"] != expected:
+        return
+    if not expired and pend["finalize_delay"]:
+        # The whole group answered early, but they explicitly chose a later
+        # finalization time. The existing timer will commit at that deadline.
+        pend["finalize_note"] = "scheduled after the requested wait period"
+        refresh_selection_message(chat_id, pend)
+        return
+    pend["timer"].cancel()
     del PENDING[chat_id]
-    assignment = "everyone" if pend["everyone"] else ", ".join(claimers)
-    commit_split(chat_id, pend["receipt"], split, pend["payer"], [f"{q['item']} assigned to {assignment}"])
+    missing = expected - pend["responded"]
+    assumptions = ["Item claims confirmed by all group members"]
+    if missing:
+        missing_names = ", ".join(pend["participants"][member] for member in sorted(missing))
+        assumptions = [f"Selection window expired; used the proposed split for {missing_names}"]
+    assumptions.append(item_selection_reasoning(pend, missing))
+    commit_split(chat_id, pend["receipt"], item_split(pend), pend["payer"], assumptions)
+
+
+def expire_item_selection(chat_id, pending_id):
+    finalize_item_selection(chat_id, pending_id, expired=True)
+
+
+def item_selection_reasoning(pend, missing):
+    selections = []
+    for name in pend["participants"].values():
+        chosen = [pend["items"][index]["name"] for index, claimers in pend["claims"].items() if name in claimers]
+        if chosen:
+            selections.append(f"{name}: {', '.join(chosen)}")
+    shared = [item.get("name", "shared charges") for item in pend["receipt"].get("items", []) if item.get("shared")]
+    reason = "Individual items were charged only to the people who selected them"
+    if selections:
+        reason += " (" + "; ".join(selections) + ")"
+    if shared:
+        reason += "; shared charges were divided across the group"
+    if missing:
+        reason += "; members without a response kept the proposed allocation"
+    return reason + "."
 
 
 def apply_mediation(chat_id, pend):
@@ -195,25 +303,49 @@ def handle_callback(cb):
     if scope != pend["kind"]:
         return answer_callback(cb["id"], "This action has expired.")
     if action == "cancel" or (scope == "mediation" and action == "keep"):
+        if scope == "items":
+            pend["timer"].cancel()
         del PENDING[chat_id]
         answer_callback(cb["id"], "Kept the original split.")
         return send(chat_id, "*No changes made.* The original split remains in the ledger.")
 
-    if scope == "split":
-        if action == "claim":
-            if who not in pend["claims"]:
-                pend["claims"].append(who)
-                answer_callback(cb["id"], "You're marked in.")
+    if scope == "items":
+        user_id = cb["from"]["id"]
+        if user_id not in pend["participants"]:
+            return answer_callback(cb["id"], "Only members in this split can respond.")
+        if action == "change":
+            if user_id in pend["responded"]:
+                pend["responded"].remove(user_id)
+                refresh_selection_message(chat_id, pend)
+                return answer_callback(cb["id"], "You can change your items now.")
+            return answer_callback(cb["id"], "You're already editing your items.")
+        if user_id in pend["responded"]:
+            return answer_callback(cb["id"], "You already finished selecting.")
+        if action.startswith("select:"):
+            try:
+                index = int(action.split(":", 1)[1])
+                item = pend["items"][index]
+            except (ValueError, IndexError):
+                return answer_callback(cb["id"], "That item is no longer available.")
+            claimers = pend["claims"].setdefault(index, set())
+            if who in claimers:
+                claimers.remove(who)
+                answer_callback(cb["id"], f"Removed {item['name']}.")
             else:
-                answer_callback(cb["id"], "You're already marked in.")
+                claimers.add(who)
+                answer_callback(cb["id"], f"Added {item['name']}.")
+            refresh_selection_message(chat_id, pend)
             return
-        if action == "everyone":
-            pend["everyone"] = True
-            answer_callback(cb["id"], "Marked as shared by everyone.")
-            return
-        if action == "finalize":
-            answer_callback(cb["id"], "Finalizing split.")
-            return finalize_split(chat_id, pend)
+        if action == "done":
+            pend["responded"].add(user_id)
+            remaining = len(set(pend["participants"]) - pend["responded"])
+            answer_callback(cb["id"], "Thanks — your items are saved.")
+            refresh_selection_message(chat_id, pend)
+            if remaining:
+                return send(chat_id, f"{who} selected: " + ", ".join(
+                    pend["items"][index]["name"] for index, claimers in pend["claims"].items() if who in claimers
+                ) + f". Waiting for {remaining} more response(s).")
+            return finalize_item_selection(chat_id, pend["id"])
 
     if scope == "mediation" and action == "apply":
         answer_callback(cb["id"], "Applying mediator proposal.")
@@ -244,19 +376,36 @@ def handle_settle(chat_id):
 
 
 def handle_dispute(chat_id, msg, complaint):
+    if PENDING.get(chat_id, {}).get("kind") == "items":
+        return send(chat_id, "Finish or cancel the current item selection before starting a dispute.")
     expenses = ledger.events(chat_id, "expense")
     if not expenses:
         return send(chat_id, "No expense logged yet to dispute.")
     exp = expenses[-1]
+    PENDING[chat_id] = {"kind": "dispute_input", "expense": exp, "complaint": complaint}
+    return send(
+        chat_id,
+        "Before I mediate, one question: *which specific item is wrong, and what did you have instead?* "
+        "Reply with the detail and I will propose a revised, explained split.",
+        reply_to=msg["message_id"],
+    )
+
+
+def resolve_dispute_input(chat_id, msg, detail):
+    pend = PENDING.get(chat_id)
+    if not pend or pend.get("kind") != "dispute_input":
+        return
+    exp = pend["expense"]
     typing(chat_id)
     send(chat_id, "_Mediating..._")
     out = mediator.mediate(
         {"items": exp.get("items", [])},
         exp["shares"],
         transcript_text(chat_id),
-        complaint,
+        pend["complaint"] + "\nFollow-up detail: " + detail,
     )
     if "_error" in out:
+        del PENDING[chat_id]
         return send(chat_id, f"Mediator failed: {out['_error']}")
 
     names = set(exp["shares"]) | set(out["new_split"])
@@ -306,6 +455,7 @@ HELP = (
     "`/settle` — minimum transfers, plus whether it's even worth it.\n"
     "`/nudge` — I write the awkward reminder for you.\n"
     "`/nudge 20` — and I'll send it on my own in 20s.\n"
+    "`/finalize 2h` — wait two hours before finalizing future receipt splits (`30m`, `eod`, or `now` also work).\n"
 )
 
 DISPUTE_RE = re.compile(
@@ -323,6 +473,9 @@ def handle_message(msg):
         TRANSCRIPT[chat_id].append(f"{name_of(msg['from'])}: {text}")
 
     cmd = text.split()[0].split("@")[0].lower() if text else ""
+    pending = PENDING.get(chat_id)
+    if pending and pending.get("kind") == "dispute_input" and text and not cmd:
+        return resolve_dispute_input(chat_id, msg, text)
     if "photo" in msg:
         return handle_photo(chat_id, msg)
     if cmd in ("/start", "/help"):
@@ -332,6 +485,15 @@ def handle_message(msg):
     if cmd == "/nudge":
         parts = text.split()
         return handle_nudge(chat_id, int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0)
+    if cmd == "/finalize":
+        value = text[len("/finalize"):].strip()
+        delay = parse_finalize_delay(value)
+        if delay is None:
+            return send(chat_id, "Use `/finalize now`, `/finalize 30m`, `/finalize 2h`, or `/finalize eod`.")
+        FINALIZE_DELAYS[chat_id] = delay
+        if delay:
+            return send(chat_id, f"Future receipt splits will post after the selected {value} wait period, even if everyone finishes early.")
+        return send(chat_id, "Future receipt splits will post as soon as everyone finishes, or when the selection window expires.")
     if cmd == "/dispute":
         return handle_dispute(chat_id, msg, text[len("/dispute"):].strip() or "unspecified")
     if DISPUTE_RE.search(text) and ledger.events(chat_id, "expense"):
