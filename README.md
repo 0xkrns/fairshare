@@ -54,7 +54,7 @@ zero. Auditability is the point: friends want to see what changed.
 Splitwise settles every debt to zero, exactly. FairShare has an opinion:
 asking a friend to transfer $3 is worse than eating it. `/settle` prunes
 trivial transfers and tells you when a group is "basically even over the last
-three trips — don't bother."
+three trips, don't bother."
 
 ## Run it
 
