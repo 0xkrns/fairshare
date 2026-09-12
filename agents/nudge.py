@@ -27,8 +27,10 @@ def draft(debtor, creditor, cents, what, transcript):
 
 
 def schedule(delay_seconds, fn, *args):
-    """Fire-and-forget timer. Swap for Trigger.dev for durable scheduling --
-    see README 'Sponsor integrations'."""
+    """Schedule a demo reminder while this bot process remains running.
+
+    This is intentionally in-memory; a process restart cancels the reminder.
+    """
     t = threading.Timer(delay_seconds, fn, args=args)
     t.daemon = True
     t.start()

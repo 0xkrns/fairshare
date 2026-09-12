@@ -35,8 +35,8 @@ FairShare lives. Drop a receipt photo into the group and five agents take over.
 | # | Agent | What it does | Why it needs the chat |
 |---|-------|--------------|----------------------|
 | 1 | **Parser** | Receipt photo → itemised JSON (`agents/parser.py`) | The photo is *already* being dropped in the group. No upload, no form. |
-| 2 | **Negotiator** | Decides a **fair** split — someone who didn't drink doesn't pay for the wine (`agents/negotiator.py`) | It knows the group's members, and can **ask one follow-up question** with tap-to-answer buttons. A web form can't ask. |
-| 3 | **Mediator** | "I didn't order that" → reads the receipt **and the conversation**, proposes a compromise, explains itself (`agents/mediator.py`) | The evidence for a dispute *is* the chat history. This agent is impossible outside the environment. |
+| 2 | **Negotiator** | Decides a **fair** split — someone who didn't drink doesn't pay for the wine (`agents/negotiator.py`) | It knows the group's members, can collect multiple tap-to-answer claims, and waits for the group to finalize. |
+| 3 | **Mediator** | "I didn't order that" → reads the receipt **and the conversation**, proposes a compromise, explains itself (`agents/mediator.py`) | The evidence for a dispute *is* the chat history; the group must approve the proposal before it changes the ledger. |
 | 4 | **Settler** | Minimum-transaction debt netting, then a verdict on whether it's even worth settling (`agents/settler.py`) | — |
 | 5 | **Nudge** | Wakes up on its own, writes the awkward reminder in the group's own tone (`agents/nudge.py`) | Delivers into the conversation, matched to how that group talks. |
 
@@ -62,7 +62,7 @@ three trips — don't bother."
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env      # add TELEGRAM_BOT_TOKEN + OPENAI_API_KEY
+cp .env.example .env      # add TELEGRAM_BOT_TOKEN + OPENROUTER_API_KEY
 python bot.py
 ```
 
@@ -75,10 +75,10 @@ python bot.py
 | Action | Agent triggered |
 |---|---|
 | send a receipt photo | Parser → Negotiator |
-| tap a name button | Negotiator (resolution) |
-| reply "I didn't order the wine" (or `/dispute ...`) | Mediator |
+| tap “I had it,” then “Finalize split” | Negotiator (resolution) |
+| reply "I didn't order the wine" (or `/dispute ...`) | Mediator proposes; group applies or keeps the original |
 | `/settle` | Settler |
-| `/nudge` / `/nudge 20` | Nudge (the `20` version fires on its own) |
+| `/nudge` / `/nudge 20` | Nudge (the `20` version fires on its own while the bot stays online) |
 
 ## Judging criteria → where to look
 
@@ -91,13 +91,12 @@ python bot.py
   LLM boundary (`llm.py`), JSON-schema-constrained calls, arithmetic kept out
   of the model, `verify.py`, and a poll loop that survives any agent failure.
 - **Usefulness & agentic experience** — one tap resolves an ambiguous split;
-  Agent 5 acts with no human prompt.
+  group approval protects every ledger adjustment; Agent 5 acts with no human prompt.
 
 ## Sponsor integrations
 
-- **OpenAI** — vision (parsing) and reasoning (all four other agents).
-- **Trigger.dev** — swap `nudge.schedule()` for a durable scheduled task so
-  reminders survive a restart. One-function change.
-- **OpenRouter** — set `REASON_MODEL` and point `llm.py`'s base URL to route
-  or fall back across models.
+- **OpenRouter** — every vision and reasoning call goes through OpenRouter's
+  OpenAI-compatible API. Configure the model slugs in `.env`.
+- **Nudge scheduling** — the current demo uses an in-memory timer. A restart
+  cancels scheduled nudges; durable scheduling is not implemented yet.
 - **ClickHouse** — the event log is already append-only; it's a drop-in sink.

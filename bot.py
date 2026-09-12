@@ -24,7 +24,7 @@ FILE_API = f"https://api.telegram.org/file/bot{TOKEN}"
 # Rolling conversation context per chat -- this is the raw material the
 # mediator and nudge agents reason over. The environment IS the data source.
 TRANSCRIPT = defaultdict(lambda: deque(maxlen=40))
-# chat_id -> pending receipt awaiting a group answer
+# chat_id -> a pending split clarification or mediation awaiting group approval
 PENDING = {}
 
 
@@ -95,10 +95,25 @@ def handle_photo(chat_id, msg):
 
     q = prop.get("question")
     if q:
-        PENDING[chat_id] = {"receipt": receipt, "prop": prop, "payer": payer, "claims": []}
-        kb = [[{"text": n, "callback_data": f"had:{n}"} for n in names[:4]]]
-        kb.append([{"text": "everyone did", "callback_data": "had:*"}])
-        return send(chat_id, f"❓ {q['text']}\n_Tap if that was you._", keyboard=kb)
+        PENDING[chat_id] = {
+            "kind": "split",
+            "receipt": receipt,
+            "prop": prop,
+            "payer": payer,
+            "claims": [],
+            "everyone": False,
+        }
+        kb = [
+            [{"text": "🙋 I had it", "callback_data": "split:claim"},
+             {"text": "Everyone shared it", "callback_data": "split:everyone"}],
+            [{"text": "Finalize split", "callback_data": "split:finalize"},
+             {"text": "Cancel", "callback_data": "split:cancel"}],
+        ]
+        return send(
+            chat_id,
+            f"❓ {q['text']}\n_Tap your answer, let others answer too, then finalize._",
+            keyboard=kb,
+        )
 
     commit_split(chat_id, receipt, prop["split"], payer, prop.get("assumptions", []))
 
@@ -124,21 +139,15 @@ def commit_split(chat_id, receipt, split, payer, assumptions):
     )
 
 
-def handle_callback(cb):
-    chat_id = cb["message"]["chat"]["id"]
-    who = name_of(cb["from"])
-    pend = PENDING.get(chat_id)
-    answer_callback(cb["id"], "got it")
-    if not pend:
-        return
-    choice = cb["data"].split(":", 1)[1]
-    pend["claims"].append(who if choice != "*" else "everyone")
-
+def finalize_split(chat_id, pend):
     q = pend["prop"]["question"]
     claimers = pend["claims"]
+    if not claimers and not pend["everyone"]:
+        return send(chat_id, "No one has answered yet. Choose an answer or cancel this split.")
+
     split = dict(pend["prop"]["split"])
-    if "everyone" not in claimers and claimers:
-        # Reassign the contested item to whoever owned up, evenly.
+    if not pend["everyone"]:
+        # Reassign the contested item to everyone who opted in, evenly.
         cents = int(q["cents"])
         per = cents // len(claimers)
         rem = cents - per * len(claimers)
@@ -149,13 +158,68 @@ def handle_callback(cb):
         split = negotiator._force_sum(split, pend["receipt"]["total_cents"], pend["payer"])
 
     del PENDING[chat_id]
-    commit_split(
+    assignment = "everyone" if pend["everyone"] else ", ".join(claimers)
+    commit_split(chat_id, pend["receipt"], split, pend["payer"], [f"{q['item']} assigned to {assignment}"])
+
+
+def apply_mediation(chat_id, pend):
+    exp, out = pend["expense"], pend["proposal"]
+    old_split, new_split = exp["shares"], out["new_split"]
+    ledger.append(
         chat_id,
-        pend["receipt"],
-        split,
-        pend["payer"],
-        [f"{q['item']} assigned to {', '.join(claimers)}"],
+        "adjustment",
+        {
+            "merchant": exp["merchant"] + " (mediated)",
+            "total_cents": 0,
+            "payer": exp["payer"],
+            "shares": {
+                name: new_split.get(name, 0) - old_split.get(name, 0)
+                for name in set(old_split) | set(new_split)
+            },
+            "reason": out.get("reasoning", ""),
+        },
     )
+    del PENDING[chat_id]
+    send(chat_id, "*Mediator proposal applied.* The original split remains in the audit log.")
+
+
+def handle_callback(cb):
+    chat_id = cb["message"]["chat"]["id"]
+    who = name_of(cb["from"])
+    pend = PENDING.get(chat_id)
+    data = cb.get("data", "")
+    if not pend or ":" not in data:
+        return answer_callback(cb["id"], "This action has expired.")
+
+    scope, action = data.split(":", 1)
+    if scope != pend["kind"]:
+        return answer_callback(cb["id"], "This action has expired.")
+    if action == "cancel" or (scope == "mediation" and action == "keep"):
+        del PENDING[chat_id]
+        answer_callback(cb["id"], "Kept the original split.")
+        return send(chat_id, "*No changes made.* The original split remains in the ledger.")
+
+    if scope == "split":
+        if action == "claim":
+            if who not in pend["claims"]:
+                pend["claims"].append(who)
+                answer_callback(cb["id"], "You're marked in.")
+            else:
+                answer_callback(cb["id"], "You're already marked in.")
+            return
+        if action == "everyone":
+            pend["everyone"] = True
+            answer_callback(cb["id"], "Marked as shared by everyone.")
+            return
+        if action == "finalize":
+            answer_callback(cb["id"], "Finalizing split.")
+            return finalize_split(chat_id, pend)
+
+    if scope == "mediation" and action == "apply":
+        answer_callback(cb["id"], "Applying mediator proposal.")
+        return apply_mediation(chat_id, pend)
+
+    answer_callback(cb["id"], "Unknown action.")
 
 
 def handle_settle(chat_id):
@@ -195,26 +259,22 @@ def handle_dispute(chat_id, msg, complaint):
     if "_error" in out:
         return send(chat_id, f"Mediator failed: {out['_error']}")
 
-    ledger.append(
-        chat_id,
-        "adjustment",
-        {
-            "merchant": exp["merchant"] + " (mediated)",
-            "total_cents": 0,
-            "payer": exp["payer"],
-            "shares": {k: out["new_split"].get(k, 0) - v for k, v in exp["shares"].items()},
-            "reason": out.get("reasoning", ""),
-        },
-    )
+    names = set(exp["shares"]) | set(out["new_split"])
     before_after = "\n".join(
-        f"  {n}: {ledger.money(exp['shares'].get(n, 0))} → {ledger.money(c)}"
-        for n, c in sorted(out["new_split"].items())
+        f"  {n}: {ledger.money(exp['shares'].get(n, 0))} → {ledger.money(out['new_split'].get(n, 0))}"
+        for n in sorted(names)
     )
+    PENDING[chat_id] = {"kind": "mediation", "expense": exp, "proposal": out}
     send(
         chat_id,
-        f"*Mediator's call* — _{out.get('contested_item', 'contested item')}_\n"
+        f"*Mediator proposal* — _{out.get('contested_item', 'contested item')}_\n"
         f"{before_after}\n\n{out.get('reasoning', '')}\n"
-        f"_confidence: {out.get('confidence', '?')}_",
+        f"_confidence: {out.get('confidence', '?')}_\n\n"
+        "Review it together, then choose whether to update the ledger.",
+        keyboard=[
+            [{"text": "Apply mediator proposal", "callback_data": "mediation:apply"},
+             {"text": "Keep original split", "callback_data": "mediation:keep"}],
+        ],
         reply_to=msg["message_id"],
     )
 
@@ -242,7 +302,7 @@ def handle_nudge(chat_id, delay=0):
 HELP = (
     "*FairShare* — I split bills where you actually argue about them.\n\n"
     "📸 *Send a receipt photo* — I itemise it and propose a _fair_ split, not an equal one.\n"
-    "↩️ *Reply to a split* with what's wrong — a mediator agent arbitrates.\n"
+    "↩️ *Reply to a split* with what's wrong — a mediator proposes a change for the group to approve.\n"
     "`/settle` — minimum transfers, plus whether it's even worth it.\n"
     "`/nudge` — I write the awkward reminder for you.\n"
     "`/nudge 20` — and I'll send it on my own in 20s.\n"
@@ -282,7 +342,21 @@ def handle_message(msg):
 
 def main():
     ledger.init()
-    me = requests.get(f"{API}/getMe", timeout=20).json()
+    if not TOKEN or TOKEN.startswith("your-"):
+        raise SystemExit("TELEGRAM_BOT_TOKEN is missing or still a placeholder in .env.")
+    try:
+        response = requests.get(f"{API}/getMe", timeout=20)
+        response.raise_for_status()
+        me = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise SystemExit(f"Could not reach Telegram's getMe endpoint: {exc}") from exc
+    if not me.get("ok") or not me.get("result"):
+        description = me.get("description", "Telegram returned no bot details.")
+        code = me.get("error_code", "unknown")
+        raise SystemExit(
+            f"Telegram getMe failed ({code}): {description}. "
+            "Check TELEGRAM_BOT_TOKEN in .env and generate a new token in @BotFather if needed."
+        )
     print("FairShare online as @%s" % me["result"]["username"])
     offset = None
     while True:

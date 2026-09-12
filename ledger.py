@@ -9,6 +9,7 @@ import json
 import sqlite3
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 
 DB = "fairshare.db"
 
@@ -37,8 +38,26 @@ def conn():
     return c
 
 
+@contextmanager
+def connection():
+    """Commit successful work and always release SQLite's file handle.
+
+    ``sqlite3.Connection`` used as a context manager does not close itself,
+    which leaves database files locked on Windows between short-lived calls.
+    """
+    c = conn()
+    try:
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+
 def init():
-    with conn() as c:
+    with connection() as c:
         c.executescript(SCHEMA)
 
 
@@ -46,7 +65,7 @@ def init():
 
 def append(chat_id, kind, payload):
     """kind: 'expense' | 'adjustment' | 'settlement' | 'note'"""
-    with conn() as c:
+    with connection() as c:
         cur = c.execute(
             "INSERT INTO events (chat_id, kind, payload, ts) VALUES (?,?,?,?)",
             (chat_id, kind, json.dumps(payload), time.time()),
@@ -60,7 +79,7 @@ def events(chat_id, kind=None):
     if kind:
         q += " AND kind=?"
         args.append(kind)
-    with conn() as c:
+    with connection() as c:
         return [
             {"id": r["id"], "kind": r["kind"], "ts": r["ts"], **json.loads(r["payload"])}
             for r in c.execute(q + " ORDER BY id", args)
@@ -68,7 +87,7 @@ def events(chat_id, kind=None):
 
 
 def get_event(chat_id, event_id):
-    with conn() as c:
+    with connection() as c:
         r = c.execute(
             "SELECT * FROM events WHERE chat_id=? AND id=?", (chat_id, event_id)
         ).fetchone()
@@ -80,7 +99,7 @@ def get_event(chat_id, event_id):
 # --------------------------------------------------------------- members
 
 def remember_member(chat_id, user_id, name):
-    with conn() as c:
+    with connection() as c:
         c.execute(
             "INSERT OR REPLACE INTO members (chat_id, user_id, name) VALUES (?,?,?)",
             (chat_id, user_id, name),
@@ -88,7 +107,7 @@ def remember_member(chat_id, user_id, name):
 
 
 def members(chat_id):
-    with conn() as c:
+    with connection() as c:
         return [
             {"user_id": r["user_id"], "name": r["name"]}
             for r in c.execute(

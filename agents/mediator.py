@@ -1,8 +1,8 @@
 """AGENT 3 -- Dispute mediator. The one that only works inside a chat.
 
 When someone says "I didn't order that", the evidence is the receipt AND the
-surrounding conversation. This agent reads both, proposes a compromise, and
-appends a correcting adjustment rather than rewriting history.
+surrounding conversation. This agent reads both and proposes a compromise;
+the group must approve it before the bot appends a correcting adjustment.
 """
 from llm import json_call
 
@@ -39,9 +39,10 @@ def mediate(receipt, current_split, transcript, complaint):
         return out
     total = sum(current_split.values())
     ns = {k: int(round(float(v))) for k, v in out.get("new_split", {}).items()}
-    if ns:
-        drift = total - sum(ns.values())
-        if drift:
-            ns[max(ns, key=ns.get)] += drift
+    if not ns:
+        return {"_error": "Mediator returned no revised split."}
+    drift = total - sum(ns.values())
+    if drift:
+        ns[max(ns, key=ns.get)] += drift
     out["new_split"] = ns
     return out

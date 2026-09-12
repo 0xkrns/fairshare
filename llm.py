@@ -1,5 +1,8 @@
-"""Thin OpenAI wrapper. Every agent goes through here so model choice,
-JSON enforcement and failure handling live in exactly one place."""
+"""OpenRouter model wrapper shared by every agent.
+
+OpenRouter exposes an OpenAI-compatible API, so the official OpenAI Python SDK
+can be used while every request is routed through OpenRouter's endpoint.
+"""
 import base64
 import json
 import os
@@ -7,17 +10,25 @@ import os
 from openai import OpenAI
 
 _client = None
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def client():
     global _client
     if _client is None:
-        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        _client = OpenAI(
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            base_url=OPENROUTER_BASE_URL,
+            default_headers={
+                "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", ""),
+                "X-OpenRouter-Title": "FairShare",
+            },
+        )
     return _client
 
 
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o")
-REASON_MODEL = os.getenv("REASON_MODEL", "gpt-4o")
+VISION_MODEL = os.getenv("VISION_MODEL", "openai/gpt-4o")
+REASON_MODEL = os.getenv("REASON_MODEL", "openai/gpt-4o")
 
 
 def json_call(system, user, model=None, image_bytes=None, schema_hint=""):

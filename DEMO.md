@@ -9,11 +9,11 @@ transcript the mediator and nudge agents reason over).
 | Time | Beat | What you say |
 |------|------|--------------|
 | 0:00–0:12 | Someone drops a restaurant receipt photo. | "Expense apps make you type the bill in. We put the agent where the photo already lands." |
-| 0:12–0:40 | Parser posts line items. Negotiator posts the split **and one question** with name buttons. | "It didn't split evenly. It spotted a $48 bottle of wine and asked who actually had it — it can ask, because it knows who's in this group." |
-| 0:40–0:55 | Someone taps their name. Final split posts. | — |
-| 0:55–1:25 | Another member replies to the split: *"I didn't order the wine, I don't drink."* Mediator replies with a revised split + reasoning. | "This is the agent that can only exist in a chat. The evidence for the dispute *is* the conversation. It's arbitrating, not calculating." |
+| 0:12–0:40 | Parser posts line items. Negotiator posts the split **and one question** with “I had it,” “Finalize,” and “Cancel” buttons. | "It didn't split evenly. It spotted a $48 bottle of wine and asked who actually had it — it can ask, because it knows who's in this group." |
+| 0:40–0:55 | One or more people tap “I had it”; someone taps “Finalize split.” | "The group can collect answers before committing anything—and cancel if the premise was wrong." |
+| 0:55–1:25 | Another member replies to the split: *"I didn't order the wine, I don't drink."* Mediator proposes a revised split + reasoning; the group taps “Apply mediator proposal.” | "This is the agent that can only exist in a chat. The evidence for the dispute is the conversation. It proposes an outcome, but people control whether it reaches the ledger." |
 | 1:25–1:45 | `/settle` → minimum transfers + the verdict. | "Minimum transactions — but it also has an opinion: don't chase $3." |
-| 1:45–2:00 | Cut to the group later: the nudge fires **with nobody prompting it**. | "And nobody asked it to send that." |
+| 1:45–2:00 | Cut to the group 20 seconds later: the nudge fires **with nobody prompting it**. | "And nobody asked it to send that. This demo timer runs while the bot is online." |
 
 **Rehearse once.** The two failure modes on camera are privacy mode still
 enabled (bot sees nothing) and a slow vision call — send the photo, then
